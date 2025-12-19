@@ -1,31 +1,37 @@
+#![no_std]
+
 mod arch;
 pub mod loader;
 mod parser;
+use alloc::string::String;
 pub use parser::ElfParser;
+extern crate alloc;
 
-type Result<T> = core::result::Result<T, ModuleLoadErr>;
+type Result<T> = core::result::Result<T, ModuleErr>;
 
 #[derive(Debug)]
-pub enum ModuleLoadErr {
+pub enum ModuleErr {
     InvalidElf,
+    InvalidOperation,
     UnsupportedArch,
-    RelocationFailed,
+    RelocationFailed(String),
     MemoryAllocationFailed,
     UnsupportedFeature,
     UndefinedSymbol,
 }
 
-impl core::fmt::Display for ModuleLoadErr {
+impl core::fmt::Display for ModuleErr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ModuleLoadErr::InvalidElf => write!(f, "Invalid ELF file"),
-            ModuleLoadErr::UnsupportedArch => write!(f, "Unsupported architecture"),
-            ModuleLoadErr::RelocationFailed => write!(f, "Relocation failed"),
-            ModuleLoadErr::MemoryAllocationFailed => write!(f, "Memory allocation failed"),
-            ModuleLoadErr::UnsupportedFeature => write!(f, "Unsupported feature encountered"),
-            ModuleLoadErr::UndefinedSymbol => write!(f, "Undefined symbol encountered"),
+            ModuleErr::InvalidElf => write!(f, "Invalid ELF file"),
+            ModuleErr::InvalidOperation => write!(f, "Invalid operation"),
+            ModuleErr::UnsupportedArch => write!(f, "Unsupported architecture"),
+            ModuleErr::RelocationFailed(msg) => write!(f, "Relocation failed: {}", msg),
+            ModuleErr::MemoryAllocationFailed => write!(f, "Memory allocation failed"),
+            ModuleErr::UnsupportedFeature => write!(f, "Unsupported feature encountered"),
+            ModuleErr::UndefinedSymbol => write!(f, "Undefined symbol encountered"),
         }
     }
 }
 
-impl core::error::Error for ModuleLoadErr {}
+impl core::error::Error for ModuleErr {}

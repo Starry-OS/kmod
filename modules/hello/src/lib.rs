@@ -1,36 +1,33 @@
-// modules/hello/src/lib.rs
 #![no_std]
-#![no_main]
 
-use kmod::declare_module;
+use kmod::{declare_module, exit_fn, init_fn};
 
-// 模块初始化函数
-#[unsafe(no_mangle)]
-pub extern "C" fn hello_init() -> i32 {
-    // 这里可以调用内核的日志功能
-    // 简化实现，直接返回成功
+unsafe extern "C" {
+    fn write_char(c: u8);
+}
+
+struct Writer;
+
+impl core::fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            unsafe { write_char(b) };
+        }
+        Ok(())
+    }
+}
+
+#[init_fn]
+pub fn hello_init() -> i32 {
+    let mut writer = Writer;
+    core::fmt::write(&mut writer, format_args!("Hello, Kernel Module!\n")).unwrap();
     0
 }
 
-// 模块清理函数
-#[unsafe(no_mangle)]
-pub extern "C" fn hello_exit() {
-    // 清理代码
+#[exit_fn]
+fn hello_exit() {
+    let mut writer = Writer;
+    core::fmt::write(&mut writer, format_args!("Goodbye, Kernel Module!\n")).unwrap();
 }
 
-// 声明模块信息
-declare_module!(
-    "hello",    // 名称
-    "1.0.0",    // 版本
-    hello_init, // 初始化函数
-    hello_exit  // 清理函数
-);
-
-// 强制导出符号
-#[used]
-#[unsafe(no_mangle)]
-pub static __module_start: u8 = 0;
-
-#[used]
-#[unsafe(no_mangle)]
-pub static __module_end: u8 = 0;
+declare_module!("hello", "1.0.0", hello_init, hello_exit);

@@ -39,3 +39,13 @@ typedef struct {
   - 如果符号未定义，则为0
   - 如果是绝对符号（SHN_ABS），则为绝对地址
 - `st_size` - 符号的大小（以字节为单位）用于调试、统计等目的
+
+
+## 特殊问题
+- 在la64架构上，如果没有设置code-model,可能会产生特殊的重定位项。比如其默认使用的medium code-model,会导致生成R_LARCH_CALL36重定位类型,这在内核模块加载时是不被支持的。因此，需要在编译时指定`-C code-model=large`来避免这种情况的发生。
+
+
+## 
+- riscv64架构对plt/got的处理: https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module-sections.c#L90
+- https://systemoverlord.com/2017/03/19/got-and-plt-for-pwning.html
+- https://crab2313.github.io/post/kernel-module/

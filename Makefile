@@ -17,7 +17,26 @@
 #   5. Clean up temporary object files
 
 # Default values
-TARGET ?= riscv64gc-unknown-none-elf
+
+ARCH ?= riscv64
+RUSTFLAGS := -C relocation-model=static
+
+ifeq ($(ARCH), x86_64)
+  TARGET := x86_64-unknown-none
+  RUSTFLAGS +=  -C code-model=kernel
+else ifeq ($(ARCH), aarch64)
+  TARGET := aarch64-unknown-none-softfloat
+else ifeq ($(ARCH), riscv64)
+  TARGET := riscv64gc-unknown-none-elf
+else ifeq ($(ARCH), loongarch64)
+  TARGET := loongarch64-unknown-none-softfloat
+  RUSTFLAGS +=  -C code-model=large
+else
+  $(error "ARCH" must be one of "x86_64", "riscv64", "aarch64" or "loongarch64")
+endif
+
+
+
 MODULE_PATHS ?= modules
 LINKER_SCRIPT ?= linker.ld
 
@@ -34,11 +53,12 @@ LINK_ARGS := \
   -C no-redzone=y
 
 # Derived variables
-ifeq ($(TARGET),riscv64gc-unknown-none-elf)
-    LD_COMMAND := riscv64-linux-gnu-ld
-else
-    LD_COMMAND := ld
-endif
+# ifeq ($(TARGET),riscv64gc-unknown-none-elf)
+#     LD_COMMAND := ld.lld 
+# else
+#     LD_COMMAND := ld
+# endif
+LD_COMMAND := ld.lld
 
 # Get list of modules (directories in MODULE_PATHS)
 MODULES := $(shell if [ -d $(MODULE_PATHS) ]; then ls -d $(MODULE_PATHS)/*/ 2>/dev/null | xargs -I {} basename {}; fi)
@@ -47,7 +67,7 @@ MODULES := $(shell if [ -d $(MODULE_PATHS) ]; then ls -d $(MODULE_PATHS)/*/ 2>/d
 BUILD_DIR := target
 MODULE_BUILD_DIR := $(BUILD_DIR)/$(TARGET)/release
 
-# Phony targets
+
 .PHONY: all clean modules $(MODULES) list-modules help
 
 # Default target
@@ -88,17 +108,15 @@ modules: $(MODULES)
 # Individual module target
 $(MODULES):
 	@echo "Building module: $@"
-	cd $(MODULE_PATHS)/$@ && cargo build $(build_args)
+	cd $(MODULE_PATHS)/$@ && RUSTFLAGS="$(RUSTFLAGS)" cargo build $(build_args)
 	@$(MAKE) process-module-library MODULE_NAME=$@ TARGET=$(TARGET) LD_COMMAND=$(LD_COMMAND)
 	@$(MAKE) verify-kernel-module KO_PATH=$(BUILD_DIR)/$@/$@.ko
 
-# Process module library and create .ko file
 .PHONY: process-module-library
 process-module-library:
 	@echo "Processing module library: $(MODULE_NAME)"
 	@bash build_module.sh $(MODULE_NAME) $(TARGET) $(MODULE_BUILD_DIR) $(BUILD_DIR) $(LD_COMMAND)
 
-# Verify kernel module
 .PHONY: verify-kernel-module
 verify-kernel-module:
 	@echo "Verifying kernel module: $(KO_PATH)"
@@ -121,17 +139,15 @@ verify-kernel-module:
 		readelf -S "$(KO_PATH)" | grep -E "^\s+\[|PROGBITS|NOBITS"; \
 	fi
 
-# Clean build artifacts
+
 clean:
 	@echo "Cleaning build artifacts..."
 	@rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
-# Rebuild
 rebuild: clean all
 	@echo "Rebuild complete"
 
-# Show configuration
 show-config:
 	@echo "Build Configuration:"
 	@echo "  TARGET: $(TARGET)"

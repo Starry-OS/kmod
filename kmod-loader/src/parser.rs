@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-
+use alloc::string::String;
+use alloc::{collections::BTreeMap, format};
 use goblin::elf::Elf;
 
 use crate::arch::{
@@ -21,21 +21,27 @@ impl<'a> ElfParser<'a> {
     }
 
     pub fn print_elf_header(&self) {
-        println!("=== ELF header ===");
-        println!("ELF Type: {}", self.get_elf_type());
-        println!("Machine: {}", self.get_machine_type());
-        println!("Version: {}", self.elf.header.e_version);
-        println!("Entry point: 0x{:x}", self.elf.header.e_entry);
+        log::info!("=== ELF header ===");
+        log::info!("ELF Type: {}", self.get_elf_type());
+        log::info!("Machine: {}", self.get_machine_type());
+        log::info!("Version: {}", self.elf.header.e_version);
+        log::info!("Entry point: 0x{:x}", self.elf.header.e_entry);
     }
 
     pub fn print_sections(&self) {
-        println!("=== Sections ===");
-        println!(
-            "{:<4} {:<25} {:<12} {:<16} {:<16} {:<12} {:<12} {:<12}",
-            "Index", "Name", "Type", "Flags", "Address", "Offset", "Size", "Align"
+        log::info!("=== Sections ===");
+        log::info!(
+            "{:<4} {:<20} {:<8} {:<4} {:<16} {:<12} {:<12} {:<4}",
+            "Index",
+            "Name",
+            "Type",
+            "Flags",
+            "Address",
+            "Offset",
+            "Size",
+            "Align"
         );
-        println!("{}", "-".repeat(110));
-
+        log::info!("{}", "-".repeat(110));
         for (idx, section) in self.elf.section_headers.iter().enumerate() {
             let name = self
                 .elf
@@ -45,7 +51,7 @@ impl<'a> ElfParser<'a> {
             let type_str = self.get_section_type(section.sh_type);
             let flags_str = self.get_section_flags(section.sh_flags);
 
-            println!(
+            log::info!(
                 "{:<4} {:<25} {:<12} {:<16} 0x{:<14x} 0x{:<14x} 0x{:<10x} {:<12}",
                 idx,
                 name,
@@ -57,15 +63,14 @@ impl<'a> ElfParser<'a> {
                 section.sh_addralign
             );
         }
-        println!();
+        log::info!("");
     }
 
     pub fn print_relocations(&self) {
-        println!("=== Relocations ===");
-
+        log::info!("=== Relocations ===");
         let mut has_relocs = false;
 
-        for (_idx, section) in self.elf.section_headers.iter().enumerate() {
+        for section in self.elf.section_headers.iter() {
             if section.sh_type == goblin::elf::section_header::SHT_REL {
                 panic!("REL relocations are not supported in this parser");
             }
@@ -76,22 +81,22 @@ impl<'a> ElfParser<'a> {
                     .shdr_strtab
                     .get_at(section.sh_name)
                     .unwrap_or("<unknown>");
-                println!("\nSection: {} (Type: RELA)", section_name);
+                log::info!("Section: {} (Type: RELA)", section_name);
                 // println!(
                 //     "{:<16} {:<35} {:<30} {:<16}",
                 //     "Offset", "Type", "Symbol", "Addend"
                 // );
                 // println!("{}", "-".repeat(100));
-                println!("{:<35} : Count", "Relocation Type");
-                println!("{}", "-".repeat(50));
+                log::info!("{:<35} : Count", "Relocation Type");
+                log::info!("{}", "-".repeat(50));
                 self.parse_and_print_rela_relocs(section);
             }
         }
 
         if !has_relocs {
-            println!("No relocation sections found\n");
+            log::info!("No relocation sections found\n");
         } else {
-            println!();
+            log::info!("");
         }
     }
 
@@ -120,7 +125,7 @@ impl<'a> ElfParser<'a> {
 
             let rel_type = self.get_rel_type(rel_type);
             let sym_name = self.get_symbol_name(sym_idx).unwrap_or("unknow");
-            
+
             if example.is_none() {
                 let fmt = format!(
                     "0x{:<14x} {:<35} {:<30} 0x{:x}",
@@ -133,16 +138,19 @@ impl<'a> ElfParser<'a> {
             *rela_ty_list.get_mut(&rel_type).unwrap() += 1;
         }
         for (rel_type, count) in rela_ty_list {
-            println!("{:<35} : {}", rel_type, count);
+            log::info!("{:<35} : {}", rel_type, count);
         }
 
         if let Some(example) = example {
-            println!("\nExample Relocation Entry Format:");
-            println!(
+            log::info!("Example Relocation Entry Format:");
+            log::info!(
                 "{:<16} {:<35} {:<30} {:<16}",
-                "Offset", "Type", "Symbol", "Addend"
+                "Offset",
+                "Type",
+                "Symbol",
+                "Addend"
             );
-            println!("{}", example);
+            log::info!("{}", example);
         }
     }
 

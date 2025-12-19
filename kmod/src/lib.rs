@@ -1,81 +1,67 @@
 #![no_std]
 #![feature(linkage)]
 
-use core::ptr;
+use core::fmt::Debug;
+pub use kmacro::{exit_fn, init_fn};
 
-// 模块元数据结构 - 与C兼容
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ModuleInfo {
-    pub magic: u32,                              // 魔数 "MODU"
-    pub name: [u8; 64],                          // 模块名称
-    pub version: [u8; 32],                       // 版本号
-    pub init_fn: Option<extern "C" fn() -> i32>, // 初始化函数
-    pub exit_fn: Option<extern "C" fn()>,        // 清理函数
-    pub size: usize,                             // 模块大小
+    pub magic: u32,
+    pub name: [u8; 64],
+    pub version: [u8; 32],
+    pub init_fn: Option<fn() -> i32>,
+    pub exit_fn: Option<fn()>,
 }
 
-pub const MODULE_MAGIC: u32 = 0x4D4F4455; // "MODU"
-
-// 模块注册表
-pub static mut MODULE_REGISTRY: [*const ModuleInfo; 256] = [ptr::null(); 256];
-pub static mut MODULE_COUNT: usize = 0;
-
-// 简化的模块加载器
-pub struct ModuleLoader;
-
-impl ModuleLoader {
-    /// 加载模块到内核
-    pub unsafe fn load_module(
-        module_data: &[u8],
-        module_size: usize,
-    ) -> Result<&'static ModuleInfo, &'static str> {
-        // 1. 验证模块基本格式
-        if module_size < core::mem::size_of::<ModuleInfo>() {
-            return Err("Module too small");
+impl Default for ModuleInfo {
+    fn default() -> Self {
+        ModuleInfo {
+            magic: 0,
+            name: [0; 64],
+            version: [0; 32],
+            init_fn: None,
+            exit_fn: None,
         }
-
-        // 2. 验证魔数
-        let magic_ptr = module_data.as_ptr() as *const u32;
-        if ptr::read_volatile(magic_ptr) != MODULE_MAGIC {
-            return Err("Invalid module magic");
-        }
-
-        // 3. 将模块数据转换为ModuleInfo引用
-        let module_info = &*(module_data.as_ptr() as *const ModuleInfo);
-
-        // 4. 注册模块
-        Self::register_module(module_info)?;
-
-        Ok(module_info)
-    }
-
-    unsafe fn register_module(module: &'static ModuleInfo) -> Result<(), &'static str> {
-        if MODULE_COUNT >= MODULE_REGISTRY.len() {
-            return Err("Module registry full");
-        }
-
-        MODULE_REGISTRY[MODULE_COUNT] = module;
-        MODULE_COUNT += 1;
-
-        Ok(())
-    }
-
-    /// 初始化所有已加载模块
-    pub unsafe fn initialize_modules() -> Result<(), &'static str> {
-        for i in 0..MODULE_COUNT {
-            let module = &*MODULE_REGISTRY[i];
-            if let Some(init_fn) = module.init_fn {
-                let result = init_fn();
-                if result != 0 {
-                    return Err("Module initialization failed");
-                }
-            }
-        }
-        Ok(())
     }
 }
 
-// 模块信息宏
+impl Debug for ModuleInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "ModuleInfo {{ name: {}, version: {}, init_fn: {:?}, exit_fn: {:?} }}",
+            self.name(),
+            self.version(),
+            self.init_fn,
+            self.exit_fn,
+        )
+    }
+}
+
+impl ModuleInfo {
+    pub fn name(&self) -> &str {
+        let len = self
+            .name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..len]).unwrap_or("Invalid UTF-8")
+    }
+
+    pub fn version(&self) -> &str {
+        let len = self
+            .version
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(self.version.len());
+        core::str::from_utf8(&self.version[..len]).unwrap_or("Invalid UTF-8")
+    }
+}
+
+// "MODU"
+pub const MODULE_MAGIC: u32 = 0x4D4F4455;
+
 #[macro_export]
 macro_rules! declare_module {
     ($name:expr, $version:expr, $init:expr, $exit:expr) => {
@@ -87,8 +73,13 @@ macro_rules! declare_module {
             version: $crate::str_to_array32($version),
             init_fn: Some($init),
             exit_fn: Some($exit),
-            size: core::mem::size_of::<$crate::ModuleInfo>(),
         };
+
+        #[cfg(target_os = "none")]
+        #[panic_handler]
+        fn panic(_info: &core::panic::PanicInfo) -> ! {
+            loop {}
+        }
     };
 }
 
@@ -112,10 +103,4 @@ pub const fn str_to_array32(s: &str) -> [u8; 32] {
         i += 1;
     }
     array
-}
-
-#[cfg(target_os = "none")]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
 }

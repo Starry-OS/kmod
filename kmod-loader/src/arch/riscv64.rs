@@ -1,89 +1,444 @@
-use goblin::{elf::SectionHeader, strtab::Strtab};
+use alloc::format;
+use alloc::string::ToString;
+use goblin::elf::SectionHeader;
 use int_enum::IntEnum;
 
+use crate::arch::{Ptr, get_rela_sym_idx, get_rela_type};
 use crate::loader::{KernelModuleHelper, ModuleLoadInfo, ModuleOwner};
-use crate::Result;
+use crate::{ModuleErr, Result};
 
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, IntEnum)]
+#[derive(Debug, Clone, Copy, IntEnum, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 /// See <https://github.com/gimli-rs/object/blob/af3ca8a2817c8119e9b6d801bd678a8f1880309d/crates/examples/src/readobj/elf.rs#L3124>
+/// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/include/uapi/asm/elf.h#L40>
 pub enum Riscv64RelocationType {
-    R_RISCV_NONE,
-    R_RISCV_32,
-    R_RISCV_64,
-    R_RISCV_RELATIVE,
-    R_RISCV_COPY,
-    R_RISCV_JUMP_SLOT,
-    R_RISCV_TLS_DTPMOD32,
-    R_RISCV_TLS_DTPMOD64,
-    R_RISCV_TLS_DTPREL32,
-    R_RISCV_TLS_DTPREL64,
-    R_RISCV_TLS_TPREL32,
-    R_RISCV_TLS_TPREL64,
-    R_RISCV_TLSDESC,
-    R_RISCV_BRANCH,
-    R_RISCV_JAL,
-    R_RISCV_CALL,
-    R_RISCV_CALL_PLT,
-    R_RISCV_GOT_HI20,
-    R_RISCV_TLS_GOT_HI20,
-    R_RISCV_TLS_GD_HI20,
-    R_RISCV_PCREL_HI20,
-    R_RISCV_PCREL_LO12_I,
-    R_RISCV_PCREL_LO12_S,
-    R_RISCV_HI20,
-    R_RISCV_LO12_I,
-    R_RISCV_LO12_S,
-    R_RISCV_TPREL_HI20,
-    R_RISCV_TPREL_LO12_I,
-    R_RISCV_TPREL_LO12_S,
-    R_RISCV_TPREL_ADD,
-    R_RISCV_ADD8,
-    R_RISCV_ADD16,
-    R_RISCV_ADD32,
-    R_RISCV_ADD64,
-    R_RISCV_SUB8,
-    R_RISCV_SUB16,
-    R_RISCV_SUB32,
-    R_RISCV_SUB64,
-    R_RISCV_GOT32_PCREL,
-    R_RISCV_ALIGN,
-    R_RISCV_RVC_BRANCH,
-    R_RISCV_RVC_JUMP,
-    R_RISCV_RVC_LUI,
-    R_RISCV_GPREL_I,
-    R_RISCV_GPREL_S,
-    R_RISCV_TPREL_I,
-    R_RISCV_TPREL_S,
-    R_RISCV_RELAX,
-    R_RISCV_SUB6,
-    R_RISCV_SET6,
-    R_RISCV_SET8,
-    R_RISCV_SET16,
-    R_RISCV_SET32,
-    R_RISCV_32_PCREL,
-    R_RISCV_IRELATIVE,
-    R_RISCV_PLT32,
-    R_RISCV_SET_ULEB128,
-    R_RISCV_SUB_ULEB128,
-    R_RISCV_TLSDESC_HI20,
-    R_RISCV_TLSDESC_LOAD_LO12,
-    R_RISCV_TLSDESC_ADD_LO12,
-    R_RISCV_TLSDESC_CALL,
+    /// None
+    R_RISCV_NONE = 0,
+    /// Runtime relocation: word32 = S + A
+    R_RISCV_32 = 1,
+    /// Runtime relocation: word64 = S + A
+    R_RISCV_64 = 2,
+    /// Runtime relocation: word32,64 = B + A
+    R_RISCV_RELATIVE = 3,
+    /// Runtime relocation: must be in executable, not allowed in shared library
+    R_RISCV_COPY = 4,
+    /// Runtime relocation: word32,64 = S; handled by PLT unless LD_BIND_NOW
+    R_RISCV_JUMP_SLOT = 5,
+    /// TLS relocation: word32 = S->TLSINDEX
+    R_RISCV_TLS_DTPMOD32 = 6,
+    /// TLS relocation: word64 = S->TLSINDEX
+    R_RISCV_TLS_DTPMOD64 = 7,
+    /// TLS relocation: word32 = TLS + S + A - TLS_TP_OFFSET
+    R_RISCV_TLS_DTPREL32 = 8,
+    /// TLS relocation: word64 = TLS + S + A - TLS_TP_OFFSET
+    R_RISCV_TLS_DTPREL64 = 9,
+    /// TLS relocation: word32 = TLS + S + A + S_TLS_OFFSET - TLS_DTV_OFFSET
+    R_RISCV_TLS_TPREL32 = 10,
+    /// TLS relocation: word64 = TLS + S + A + S_TLS_OFFSET - TLS_DTV_OFFSET
+    R_RISCV_TLS_TPREL64 = 11,
+    /// PC-relative branch (SB-Type)
+    R_RISCV_BRANCH = 16,
+    /// PC-relative jump (UJ-Type)
+    R_RISCV_JAL = 17,
+    /// PC-relative call: MACRO call,tail (auipc+jalr pair)
+    R_RISCV_CALL = 18,
+    /// PC-relative call (PLT): MACRO call,tail (auipc+jalr pair) PIC
+    R_RISCV_CALL_PLT = 19,
+    /// PC-relative GOT reference: MACRO la
+    R_RISCV_GOT_HI20 = 20,
+    /// PC-relative TLS IE GOT offset: MACRO la.tls.ie
+    R_RISCV_TLS_GOT_HI20 = 21,
+    /// PC-relative TLS GD reference: MACRO la.tls.gd
+    R_RISCV_TLS_GD_HI20 = 22,
+    /// PC-relative reference: %pcrel_hi(symbol) (U-Type)
+    R_RISCV_PCREL_HI20 = 23,
+    /// PC-relative reference: %pcrel_lo(symbol) (I-Type)
+    R_RISCV_PCREL_LO12_I = 24,
+    /// PC-relative reference: %pcrel_lo(symbol) (S-Type)
+    R_RISCV_PCREL_LO12_S = 25,
+    /// Absolute address: %hi(symbol) (U-Type)
+    R_RISCV_HI20 = 26,
+    /// Absolute address: %lo(symbol) (I-Type)
+    R_RISCV_LO12_I = 27,
+    /// Absolute address: %lo(symbol) (S-Type)
+    R_RISCV_LO12_S = 28,
+    /// TLS LE thread offset: %tprel_hi(symbol) (U-Type)
+    R_RISCV_TPREL_HI20 = 29,
+    /// TLS LE thread offset: %tprel_lo(symbol) (I-Type)
+    R_RISCV_TPREL_LO12_I = 30,
+    /// TLS LE thread offset: %tprel_lo(symbol) (S-Type)
+    R_RISCV_TPREL_LO12_S = 31,
+    /// TLS LE thread usage: %tprel_add(symbol)
+    R_RISCV_TPREL_ADD = 32,
+    /// 8-bit label addition: word8 = S + A
+    R_RISCV_ADD8 = 33,
+    /// 16-bit label addition: word16 = S + A
+    R_RISCV_ADD16 = 34,
+    /// 32-bit label addition: word32 = S + A
+    R_RISCV_ADD32 = 35,
+    /// 64-bit label addition: word64 = S + A
+    R_RISCV_ADD64 = 36,
+    /// 8-bit label subtraction: word8 = S - A
+    R_RISCV_SUB8 = 37,
+    /// 16-bit label subtraction: word16 = S - A
+    R_RISCV_SUB16 = 38,
+    /// 32-bit label subtraction: word32 = S - A
+    R_RISCV_SUB32 = 39,
+    /// 64-bit label subtraction: word64 = S - A
+    R_RISCV_SUB64 = 40,
+    /// GNU C++ vtable hierarchy
+    R_RISCV_GNU_VTINHERIT = 41,
+    /// GNU C++ vtable member usage
+    R_RISCV_GNU_VTENTRY = 42,
+    /// Alignment statement
+    R_RISCV_ALIGN = 43,
+    /// PC-relative branch offset (CB-Type)
+    R_RISCV_RVC_BRANCH = 44,
+    /// PC-relative jump offset (CJ-Type)
+    R_RISCV_RVC_JUMP = 45,
+    /// Absolute address (CI-Type)
+    R_RISCV_RVC_LUI = 46,
+    /// GP-relative reference (I-Type)
+    R_RISCV_GPREL_I = 47,
+    /// GP-relative reference (S-Type)
+    R_RISCV_GPREL_S = 48,
+    /// TP-relative TLS LE load (I-Type)
+    R_RISCV_TPREL_I = 49,
+    /// TP-relative TLS LE store (S-Type)
+    R_RISCV_TPREL_S = 50,
+    /// Instruction pair can be relaxed
+    R_RISCV_RELAX = 51,
+    /// Local label subtraction
+    R_RISCV_SUB6 = 52,
+    /// Local label subtraction
+    R_RISCV_SET6 = 53,
+    /// Local label subtraction
+    R_RISCV_SET8 = 54,
+    /// Local label subtraction
+    R_RISCV_SET16 = 55,
+    /// Local label subtraction
+    R_RISCV_SET32 = 56,
 }
 
-impl Riscv64RelocationType {}
+/// The auipc+jalr instruction pair can reach any PC-relative offset
+/// in the range [-2^31 - 2^11, 2^31 - 2^11)
+const fn riscv_insn_valid_32bit_offset(offset: i64) -> bool {
+    // return (-(1L << 31) - (1L << 11)) <= val && val < ((1L << 31) - (1L << 11));
+    let low = (-(1i64 << 31)) - (1i64 << 11);
+    let high = (1i64 << 31) - (1i64 << 11);
+    low <= offset && offset < high
+}
+
+impl Riscv64RelocationType {
+    fn apply_r_riscv_32_rela(location: Ptr, address: u64) -> Result<()> {
+        if address != address as u32 as u64 {
+            return Err(ModuleErr::RelocationFailed(format!(
+                "R_RISCV_32: target {:016x} does not fit in 32 bits",
+                address
+            )));
+        }
+        // Write the lower 32 bits to the location
+        location.write(address as u32);
+        Ok(())
+    }
+
+    fn apply_r_riscv_64_rela(location: Ptr, address: u64) -> Result<()> {
+        // Write the full 64 bits to the location
+        location.write(address);
+        Ok(())
+    }
+
+    fn apply_r_riscv_branch_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+
+        let imm12 = ((offset & 0x1000) << (31 - 12)) as u32;
+        let imm11 = ((offset & 0x800) >> (11 - 7)) as u32;
+        let imm10_5 = ((offset & 0x7e0) << (30 - 10)) as u32;
+        let imm4_1 = ((offset & 0x1e) << (11 - 4)) as u32;
+
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0x1fff07f) | imm12 | imm11 | imm10_5 | imm4_1);
+        Ok(())
+    }
+
+    fn apply_r_riscv_jal_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+
+        let imm20 = ((offset & 0x100000) << (31 - 20)) as u32;
+        let imm19_12 = (offset & 0xff000) as u32;
+        let imm11 = ((offset & 0x800) << (20 - 11)) as u32;
+        let imm10_1 = ((offset & 0x7fe) << (30 - 10)) as u32;
+
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0xFFF) | imm20 | imm19_12 | imm11 | imm10_1);
+        Ok(())
+    }
+
+    fn apply_r_riscv_rvc_branch_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+        let imm8 = ((offset & 0x100) << (12 - 8)) as u16;
+        let imm7_6 = ((offset & 0xc0) >> (6 - 5)) as u16;
+        let imm5 = ((offset & 0x20) >> (5 - 2)) as u16;
+        let imm4_3 = ((offset & 0x18) << (12 - 5)) as u16;
+        let imm2_1 = ((offset & 0x6) << (12 - 10)) as u16;
+
+        let original_inst = location.read::<u16>();
+        location.write((original_inst & 0xe383) | imm8 | imm7_6 | imm5 | imm4_3 | imm2_1);
+        Ok(())
+    }
+
+    fn apply_r_riscv_rvc_jump_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+        let imm11 = ((offset & 0x800) << (12 - 11)) as u16;
+        let imm10 = ((offset & 0x400) >> (10 - 8)) as u16;
+        let imm9_8 = ((offset & 0x300) << (12 - 11)) as u16;
+        let imm7 = ((offset & 0x80) >> (7 - 6)) as u16;
+        let imm6 = ((offset & 0x40) << (12 - 11)) as u16;
+        let imm5 = ((offset & 0x20) >> (5 - 2)) as u16;
+        let imm4 = ((offset & 0x10) << (12 - 5)) as u16;
+        let imm3_1 = ((offset & 0xe) << (12 - 10)) as u16;
+
+        let original_inst = location.read::<u16>();
+        location.write(
+            (original_inst & 0xe003) | imm11 | imm10 | imm9_8 | imm7 | imm6 | imm5 | imm4 | imm3_1,
+        );
+        Ok(())
+    }
+
+    fn apply_r_riscv_pcrel_hi20_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+        if !riscv_insn_valid_32bit_offset(offset) {
+            return Err(ModuleErr::RelocationFailed(format!(
+                "R_RISCV_PCREL_HI20: target {:016x} can not be addressed by the 32-bit offset from PC = {:p}",
+                address,
+                location.as_ptr::<u32>()
+            )));
+        }
+        let hi20 = (offset + 0x800) & 0xfffff000;
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0xfff) | (hi20 as u32));
+        Ok(())
+    }
+
+    fn apply_r_riscv_pcrel_lo12_i_rela(location: Ptr, address: u64) -> Result<()> {
+        // address is the lo12 value to fill. It is calculated before calling this handler.
+
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0xfffff) | ((address as u32 & 0xfff) << 20));
+        Ok(())
+    }
+
+    fn apply_r_riscv_pcrel_lo12_s_rela(location: Ptr, address: u64) -> Result<()> {
+        // address is the lo12 value to fill. It is calculated before calling this handler.
+
+        let imm11_5 = (address as u32 & 0xfe0) << (31 - 11);
+        let imm4_0 = (address as u32 & 0x1f) << (11 - 4);
+
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0x1fff07f) | imm11_5 | imm4_0);
+        Ok(())
+    }
+
+    /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c#L149>
+    fn apply_r_riscv_hi20_rela(location: Ptr, address: u64) -> Result<()> {
+        // if (IS_ENABLED(CONFIG_CMODEL_MEDLOW)) // --- IGNORE ---
+        let hi20 = (address + 0x800) & 0xfffff000;
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0xfff) | (hi20 as u32));
+        Ok(())
+    }
+
+    fn apply_r_riscv_lo12_i_rela(location: Ptr, address: u64) -> Result<()> {
+        // Skip medlow checking because of filtering by HI20 already
+
+        let address = address as i32;
+        let hi20 = (address + 0x800) & (0xfffff000_u32 as i32);
+        let lo12 = address - hi20;
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0xfffff) | ((lo12 as u32 & 0xfff) << 20));
+        Ok(())
+    }
+
+    fn apply_r_riscv_lo12_s_rela(location: Ptr, address: u64) -> Result<()> {
+        // Skip medlow checking because of filtering by HI20 already
+
+        let address = address as i32;
+        let hi20 = (address + 0x800) & (0xfffff000_u32 as i32);
+        let lo12 = address - hi20;
+        let imm11_5 = (lo12 as u32 & 0xfe0) << (31 - 11);
+        let imm4_0 = (lo12 as u32 & 0x1f) << (11 - 4);
+        let original_inst = location.read::<u32>();
+        location.write((original_inst & 0x1fff07f) | imm11_5 | imm4_0);
+        Ok(())
+    }
+
+    /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c#L188>
+    fn apply_r_riscv_got_hi20_rela(_location: Ptr, _address: u64) -> Result<()> {
+        unimplemented!("R_RISCV_GOT_HI20 relocation not implemented yet");
+        // Always emit the got entry
+    }
+
+    /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c#L210>
+    fn apply_r_riscv_call_plt_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+        if !riscv_insn_valid_32bit_offset(offset) {
+            // Only emit the plt entry if offset over 32-bit range
+            return Err(ModuleErr::RelocationFailed(format!(
+                "R_RISCV_CALL_PLT: target {:016x} can not be addressed by the 32-bit offset from PC = {:p}",
+                address,
+                location.as_ptr::<u32>()
+            )));
+        }
+        let hi20 = (offset + 0x800) & 0xfffff000;
+        let lo12 = (offset - hi20) & 0xfff;
+        let original_auipc = location.read::<u32>();
+        location.write((original_auipc & 0xfff) | (hi20 as u32));
+        let original_jalr_ptr = location.add(4);
+        let original_jalr = original_jalr_ptr.read::<u32>();
+        original_jalr_ptr.write((original_jalr & 0xfffff) | ((lo12 as u32) << 20));
+        Ok(())
+    }
+
+    fn apply_r_riscv_call_rela(location: Ptr, address: u64) -> Result<()> {
+        let offset = address as i64 - location.0 as i64;
+        if !riscv_insn_valid_32bit_offset(offset) {
+            return Err(ModuleErr::RelocationFailed(format!(
+                "R_RISCV_CALL: target {:016x} can not be addressed by the 32-bit offset from PC = {:p}",
+                address,
+                location.as_ptr::<u32>()
+            )));
+        }
+        let hi20 = (offset + 0x800) & 0xfffff000;
+        let lo12 = (offset - hi20) & 0xfff;
+        let original_auipc = location.read::<u32>();
+        location.write((original_auipc & 0xfff) | (hi20 as u32));
+        let original_jalr_ptr = location.add(4);
+        let original_jalr = original_jalr_ptr.read::<u32>();
+        original_jalr_ptr.write((original_jalr & 0xfffff) | ((lo12 as u32) << 20));
+        Ok(())
+    }
+
+    fn apply_r_riscv_relax_rela(_location: Ptr, _address: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn apply_r_riscv_align_rela(location: Ptr, _address: u64) -> Result<()> {
+        Err(ModuleErr::RelocationFailed(format!(
+            "The unexpected relocation type 'R_RISCV_ALIGN' from PC = %{:p}",
+            location.as_ptr::<u32>()
+        )))
+    }
+
+    fn apply_r_riscv_add16_rela(location: Ptr, address: u64) -> Result<()> {
+        location.write(address as u16);
+        Ok(())
+    }
+
+    fn apply_r_riscv_add32_rela(location: Ptr, address: u64) -> Result<()> {
+        location.write(address as u32);
+        Ok(())
+    }
+
+    fn apply_r_riscv_add64_rela(location: Ptr, address: u64) -> Result<()> {
+        location.write(address);
+        Ok(())
+    }
+
+    fn apply_r_riscv_sub16_rela(location: Ptr, address: u64) -> Result<()> {
+        let value = location.read::<u16>();
+        location.write(value - address as u16);
+        Ok(())
+    }
+
+    fn apply_r_riscv_sub32_rela(location: Ptr, address: u64) -> Result<()> {
+        let value = location.read::<u32>();
+        location.write(value - address as u32);
+        Ok(())
+    }
+
+    fn apply_r_riscv_sub64_rela(location: Ptr, address: u64) -> Result<()> {
+        let value = location.read::<u64>();
+        location.write(value - address);
+        Ok(())
+    }
+
+    pub fn apply_relocation(&self, location: u64, address: u64) -> Result<()> {
+        let location = Ptr(location);
+        match self {
+            Riscv64RelocationType::R_RISCV_32 => Self::apply_r_riscv_32_rela(location, address),
+            Riscv64RelocationType::R_RISCV_64 => Self::apply_r_riscv_64_rela(location, address),
+            Riscv64RelocationType::R_RISCV_BRANCH => {
+                Self::apply_r_riscv_branch_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_JAL => Self::apply_r_riscv_jal_rela(location, address),
+            Riscv64RelocationType::R_RISCV_RVC_BRANCH => {
+                Self::apply_r_riscv_rvc_branch_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_RVC_JUMP => {
+                Self::apply_r_riscv_rvc_jump_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_PCREL_HI20 => {
+                Self::apply_r_riscv_pcrel_hi20_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_PCREL_LO12_I => {
+                Self::apply_r_riscv_pcrel_lo12_i_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_PCREL_LO12_S => {
+                Self::apply_r_riscv_pcrel_lo12_s_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_HI20 => Self::apply_r_riscv_hi20_rela(location, address),
+            Riscv64RelocationType::R_RISCV_LO12_I => {
+                Self::apply_r_riscv_lo12_i_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_LO12_S => {
+                Self::apply_r_riscv_lo12_s_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_GOT_HI20 => {
+                Self::apply_r_riscv_got_hi20_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_CALL_PLT => {
+                Self::apply_r_riscv_call_plt_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_CALL => Self::apply_r_riscv_call_rela(location, address),
+            Riscv64RelocationType::R_RISCV_RELAX => {
+                Self::apply_r_riscv_relax_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_ALIGN => {
+                Self::apply_r_riscv_align_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_ADD16 => {
+                Self::apply_r_riscv_add16_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_ADD32 => {
+                Self::apply_r_riscv_add32_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_ADD64 => {
+                Self::apply_r_riscv_add64_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_SUB16 => {
+                Self::apply_r_riscv_sub16_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_SUB32 => {
+                Self::apply_r_riscv_sub32_rela(location, address)
+            }
+            Riscv64RelocationType::R_RISCV_SUB64 => {
+                Self::apply_r_riscv_sub64_rela(location, address)
+            }
+            _ => unimplemented!("RISC-V relocation application not implemented yet"),
+        }
+    }
+}
 
 pub struct Riscv64ArchRelocate;
 
+#[allow(unused_assignments)]
 impl Riscv64ArchRelocate {
     /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c>
     /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c#L313>
     pub fn apply_relocate_add<H: KernelModuleHelper>(
         elf_data: &[u8],
         sechdrs: &[SectionHeader],
-        strtab: &Strtab<'_>,
         load_info: &ModuleLoadInfo,
         relsec: usize,
         module: &ModuleOwner<H>,
@@ -103,21 +458,88 @@ impl Riscv64ArchRelocate {
             )
         };
         for rela in rela_list {
-            let rel_offset = rela.r_offset;
-            let r_info = rela.r_info;
-            let addend = rela.r_addend;
-            let rel_type = (r_info & 0xffffffff) as u32;
-            let sym_idx = (r_info >> 32) as usize;
+            let rel_type = get_rela_type(rela.r_info);
+            let sym_idx = get_rela_sym_idx(rela.r_info);
 
             // This is where to make the change
-            let location = sechdrs[rel_section.sh_info as usize]
-                .sh_addr
-                .wrapping_add(rel_offset);
-
+            let location = sechdrs[rel_section.sh_info as usize].sh_addr + rela.r_offset;
             let sym = load_info.syms[sym_idx];
 
-            let reloc_type = Riscv64RelocationType::try_from(rel_type).unwrap();
+            let reloc_type = Riscv64RelocationType::try_from(rel_type).map_err(|_| {
+                ModuleErr::RelocationFailed(format!("Invalid relocation type: {}", rel_type))
+            })?;
+
+            let sym_name = &load_info.symbol_names[sym_idx];
+
+            let mut target_addr = sym.st_value as i64 + rela.r_addend;
+
+            if reloc_type == Riscv64RelocationType::R_RISCV_PCREL_LO12_I
+                || reloc_type == Riscv64RelocationType::R_RISCV_PCREL_LO12_S
+            {
+                // PC-relative relocation
+                let mut find = false;
+                for inner_rela in rela_list {
+                    let hi20_loc =
+                        sechdrs[rel_section.sh_info as usize].sh_addr + inner_rela.r_offset;
+                    let hi20_type = get_rela_type(inner_rela.r_info);
+                    let hi20_type = Riscv64RelocationType::try_from(hi20_type).map_err(|_| {
+                        ModuleErr::RelocationFailed(format!(
+                            "Invalid relocation type: {}",
+                            hi20_type
+                        ))
+                    })?;
+
+                    // Find the corresponding HI20 relocation entry
+                    if hi20_loc == sym.st_value
+                        && (hi20_type == Riscv64RelocationType::R_RISCV_PCREL_HI20
+                            || hi20_type == Riscv64RelocationType::R_RISCV_GOT_HI20)
+                    {
+                        let hi20_sym = load_info.syms[get_rela_sym_idx(inner_rela.r_info)];
+
+                        let hi20_sym_val = hi20_sym.st_value as i64 + inner_rela.r_addend;
+                        // Calculate lo12
+                        let offset = hi20_sym_val - hi20_loc as i64;
+
+                        // if (IS_ENABLED(CONFIG_MODULE_SECTIONS)
+                        //     && hi20_type == R_RISCV_GOT_HI20) {
+                        //     offset = module_emit_got_entry(me, hi20_sym_val);
+                        //     offset = offset - hi20_loc;
+                        // }
+
+                        if hi20_type == Riscv64RelocationType::R_RISCV_GOT_HI20 {
+                            unimplemented!("GOT handling not implemented yet");
+                        }
+
+                        let hi_20 = (offset + 0x800) & 0xfffff000;
+                        let lo_12 = offset - hi_20;
+
+                        // update target_addr
+                        target_addr = lo_12;
+                        find = true;
+                        break;
+                    }
+                }
+                if !find {
+                    log::error!(
+                        "[{}]: ({}) Can not find HI20 relocation information for LO12 relocation",
+                        module.name(),
+                        sym_name
+                    );
+                    return Err(ModuleErr::RelocationFailed(
+                        "Missing HI20 relocation for LO12".to_string(),
+                    ));
+                }
+            }
+            let res = reloc_type.apply_relocation(location, target_addr as u64);
+            match res {
+                Err(e) => {
+                    let sym_name = &load_info.symbol_names[sym_idx];
+                    log::error!("[{}]: ({}) {:?}", module.name(), sym_name, e);
+                    return Err(e);
+                }
+                Ok(_) => { /* Successfully applied relocation */ }
+            }
         }
-        todo!("RISC-V relocation application not implemented yet");
+        Ok(())
     }
 }

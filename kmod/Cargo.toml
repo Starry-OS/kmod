@@ -8,3 +8,4 @@ name = "kmod"
 
 
 [dependencies]
+kmacro = { path = "../kmacro" }

@@ -1,8 +1,15 @@
-use core::fmt::Display;
+use crate::{ModuleErr, Result};
 
-use crate::{ModuleLoadErr, Result};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use bitflags::bitflags;
-use goblin::elf::Elf;
+use core::fmt::Display;
+use goblin::elf::{Elf, SectionHeader};
+use kmod::ModuleInfo;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,7 +21,7 @@ bitflags! {
 }
 
 impl Display for SectionPerm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut perms = String::new();
         if self.contains(SectionPerm::READ) {
             perms.push('R');
@@ -46,14 +53,24 @@ impl SectionPerm {
     }
 }
 
+/// Trait to get raw pointer from a reference
+pub trait SectionMemOps {
+    fn as_ptr(&self) -> *const u8;
+    fn as_mut_ptr(&mut self) -> *mut u8;
+    /// Change the permissions of the memory region
+    fn change_perms(&mut self, perms: SectionPerm) -> bool;
+}
+
 /// Trait for kernel module helper functions
 pub trait KernelModuleHelper {
     /// Allocate virtual memory for module section
-    fn vmalloc(size: usize, perms: SectionPerm) -> *mut u8;
-    /// Free virtual memory allocated for module section
-    fn vfree(ptr: *mut u8, size: usize);
+    fn vmalloc(size: usize) -> Box<dyn SectionMemOps>;
     /// Resolve symbol name to address
     fn resolve_symbol(name: &str) -> Option<usize>;
+    /// Flush CPU cache for the given memory region
+    fn flsuh_cache(_addr: usize, _size: usize) {
+        // Default implementation does nothing
+    }
 }
 
 pub struct ModuleLoader<'a, H: KernelModuleHelper> {
@@ -65,21 +82,40 @@ pub struct ModuleLoader<'a, H: KernelModuleHelper> {
 
 struct SectionPages {
     name: String,
-    addr: *mut u8,
+    addr: Box<dyn SectionMemOps>,
     size: usize,
     perms: SectionPerm,
 }
 
 pub struct ModuleOwner<H: KernelModuleHelper> {
-    name: Option<String>,
+    module_info: ModuleInfo,
     pages: Vec<SectionPages>,
     _helper: core::marker::PhantomData<H>,
 }
 
-impl<H: KernelModuleHelper> Drop for ModuleOwner<H> {
-    fn drop(&mut self) {
-        for page in &self.pages {
-            H::vfree(page.addr, page.size);
+impl<H: KernelModuleHelper> ModuleOwner<H> {
+    /// Get the name of the module
+    pub fn name(&self) -> &str {
+        self.module_info.name()
+    }
+
+    /// Call the module's init function
+    pub fn call_init(&mut self) -> Result<i32> {
+        if let Some(init_fn) = self.module_info.init_fn.take() {
+            let result = init_fn();
+            Ok(result)
+        } else {
+            log::warn!("The init function can only be called once.");
+            Err(ModuleErr::InvalidOperation)
+        }
+    }
+
+    /// Call the module's exit function
+    pub fn call_exit(&mut self) {
+        if let Some(exit_fn) = self.module_info.exit_fn.take() {
+            exit_fn();
+        } else {
+            log::warn!("The exit function can only be called once.");
         }
     }
 }
@@ -88,20 +124,21 @@ const fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
-const fn align_down(addr: usize, align: usize) -> usize {
-    addr & !(align - 1)
-}
+// const fn align_down(addr: usize, align: usize) -> usize {
+//     addr & !(align - 1)
+// }
 
 pub struct ModuleLoadInfo {
     pub(crate) syms: Vec<goblin::elf::sym::Sym>,
+    pub(crate) symbol_names: Vec<String>,
 }
 
 impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
     /// create a new ELF loader
     pub fn new(elf_data: &'a [u8]) -> Result<Self> {
-        let elf = Elf::parse(elf_data).map_err(|_| ModuleLoadErr::InvalidElf)?;
+        let elf = Elf::parse(elf_data).map_err(|_| ModuleErr::InvalidElf)?;
         if !elf.is_64 {
-            return Err(ModuleLoadErr::UnsupportedArch);
+            return Err(ModuleErr::UnsupportedArch);
         }
         let module_name = elf.shdr_strtab.get_at(elf.header.e_shstrndx as usize);
         Ok(ModuleLoader {
@@ -114,21 +151,90 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
 
     /// Load the module into kernel space
     pub fn load_module(mut self) -> Result<ModuleOwner<H>> {
-        let owner = self.layout_and_allocate()?;
+        let mut owner = self.pre_read_modinfo()?;
+        self.layout_and_allocate(&mut owner)?;
         let load_info = self.simplify_symbols()?;
         self.apply_relocations(load_info, &owner)?;
-        unimplemented!()
+
+        self.post_read_modinfo(&mut owner)?;
+
+        self.set_section_perms(&mut owner)?;
+
+        log::error!(
+            "Module({}) loaded successfully, info: {:?}",
+            owner.name(),
+            owner.module_info
+        );
+        Ok(owner)
+    }
+
+    fn find_modinfo_section(&self) -> Result<&SectionHeader> {
+        for shdr in &self.elf.section_headers {
+            let sec_name = self
+                .elf
+                .shdr_strtab
+                .get_at(shdr.sh_name)
+                .ok_or(ModuleErr::InvalidElf)?;
+
+            if sec_name == ".modinfo" {
+                return Ok(shdr);
+            }
+        }
+        Err(ModuleErr::InvalidElf)
+    }
+
+    fn pre_read_modinfo(&self) -> Result<ModuleOwner<H>> {
+        let modinfo_shdr = self.find_modinfo_section()?;
+        let file_offset = modinfo_shdr.sh_offset as usize;
+        let size = modinfo_shdr.sh_size as usize;
+
+        if size != core::mem::size_of::<ModuleInfo>() {
+            return Err(ModuleErr::InvalidElf);
+        }
+
+        let modinfo_data = &self.elf_data[file_offset..file_offset + size];
+        let module_info: ModuleInfo =
+            unsafe { core::ptr::read(modinfo_data.as_ptr() as *const ModuleInfo) };
+
+        Ok(ModuleOwner {
+            module_info,
+            pages: Vec::new(),
+            _helper: core::marker::PhantomData,
+        })
+    }
+
+    fn post_read_modinfo(&mut self, owner: &mut ModuleOwner<H>) -> Result<()> {
+        let modinfo_shdr = self.find_modinfo_section()?;
+        let size = modinfo_shdr.sh_size as usize;
+
+        if size != core::mem::size_of::<ModuleInfo>() {
+            return Err(ModuleErr::InvalidElf);
+        }
+        // the data address is the allocated virtual address and it has been relocated
+        let modinfo_data = modinfo_shdr.sh_addr as *mut u8;
+        let module_info = unsafe { core::ptr::read(modinfo_data as *const ModuleInfo) };
+        owner.module_info = module_info;
+        Ok(())
+    }
+
+    fn set_section_perms(&self, owner: &mut ModuleOwner<H>) -> Result<()> {
+        for page in &mut owner.pages {
+            if !page.addr.change_perms(page.perms) {
+                log::error!(
+                    "Failed to change permissions of section '{}' to {}",
+                    page.name,
+                    page.perms
+                );
+                return Err(ModuleErr::InvalidOperation);
+            }
+            H::flsuh_cache(page.addr.as_ptr() as usize, page.size);
+        }
+        Ok(())
     }
 
     /// Layout sections and allocate memory
     /// See <https://elixir.bootlin.com/linux/v6.6/source/kernel/module/main.c#L2363>
-    fn layout_and_allocate(&mut self) -> Result<ModuleOwner<H>> {
-        let mut owner = ModuleOwner {
-            name: self.module_name.map(|s| s.to_string()),
-            pages: Vec::new(),
-            _helper: core::marker::PhantomData,
-        };
-
+    fn layout_and_allocate(&mut self, owner: &mut ModuleOwner<H>) -> Result<()> {
         for shdr in &mut self.elf.section_headers {
             let sec_name = self
                 .elf
@@ -141,27 +247,35 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 continue;
             }
 
-            let perms = SectionPerm::from_elf_flags(shdr.sh_flags);
+            assert!(
+                shdr.sh_addr % 4096 == 0,
+                "Section '{}' address not page-aligned",
+                sec_name
+            );
+            let file_offset = shdr.sh_offset as usize;
             let size = shdr.sh_size as usize;
 
+            let perms = SectionPerm::from_elf_flags(shdr.sh_flags);
+
             if size == 0 {
-                println!("Skipping zero-size section '{}'", sec_name);
+                log::error!("Skipping zero-size section '{}'", sec_name);
                 continue;
             }
 
             let aligned_size = align_up(size, 4096);
 
             // Allocate memory for the section
-            let addr = H::vmalloc(aligned_size, perms);
-            if addr.is_null() {
-                return Err(ModuleLoadErr::MemoryAllocationFailed);
+            let mut addr = H::vmalloc(aligned_size);
+            if addr.as_ptr().is_null() {
+                return Err(ModuleErr::MemoryAllocationFailed);
             }
 
+            let raw_addr = addr.as_ptr() as u64;
+
             // Copy section data from ELF to allocated memory
-            let file_offset = shdr.sh_offset as usize;
             let section_data = &self.elf_data[file_offset..file_offset + size];
             unsafe {
-                core::ptr::copy_nonoverlapping(section_data.as_ptr(), addr, size);
+                core::ptr::copy_nonoverlapping(section_data.as_ptr(), addr.as_mut_ptr(), size);
             }
 
             // Store the allocated page info
@@ -175,24 +289,30 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
             // update section address
             // Note: In a real loader, we would update the section header's sh_addr field
             // to reflect the new virtual address.
-            shdr.sh_addr = addr as u64;
+            shdr.sh_addr = raw_addr;
         }
 
         for page in &owner.pages {
-            println!(
+            log::error!(
                 "Allocated section '{:>16}' at {:p} [{}] ({:8<#x})",
-                page.name, page.addr, page.perms, page.size
+                page.name,
+                page.addr.as_ptr(),
+                page.perms,
+                page.size
             );
         }
 
-        Ok(owner)
+        Ok(())
     }
 
     /// Change all symbols so that st_value encodes the pointer directly.
     ///
     /// See <https://elixir.bootlin.com/linux/v6.6/source/kernel/module/main.c#L1367>
     fn simplify_symbols(&self) -> Result<ModuleLoadInfo> {
-        let mut loadinfo = ModuleLoadInfo { syms: Vec::new() };
+        let mut loadinfo = ModuleLoadInfo {
+            syms: Vec::new(),
+            symbol_names: Vec::new(),
+        };
 
         for sym in self.elf.syms.iter() {
             let sym_name = self.elf.strtab.get_at(sym.st_name).unwrap_or("<unknown>");
@@ -202,7 +322,7 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
             let sym_size = sym.st_size;
 
             // For debugging purposes, print symbol info
-            log::info!(
+            log::debug!(
                 "Symbol: ('{}') [{}] Value: 0x{:016x} Size: {}",
                 sym_name,
                 sym_section_to_str(sym.st_shndx as _),
@@ -210,7 +330,8 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 sym_size
             );
 
-            loadinfo.syms.push(sym.clone());
+            loadinfo.syms.push(sym);
+            loadinfo.symbol_names.push(sym_name.clone());
 
             match sym.st_shndx as _ {
                 goblin::elf::section_header::SHN_UNDEF => {
@@ -218,7 +339,7 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                     let sym_address = H::resolve_symbol(&sym_name);
                     // Ok if resolved.
                     if let Some(addr) = sym_address {
-                        log::trace!(
+                        log::error!(
                             "  -> Resolved undefined symbol '{}' ({}) to address 0x{:016x}",
                             sym_name,
                             sym_bind_to_str(sym.st_bind()),
@@ -256,7 +377,7 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                         "{}: please compile with -fno-common",
                         self.module_name.unwrap_or("<unknown>")
                     );
-                    return Err(ModuleLoadErr::UnsupportedFeature);
+                    return Err(ModuleErr::UnsupportedFeature);
                 }
                 ty => {
                     /* Divert to percpu allocation if a percpu var. */
@@ -265,7 +386,6 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                     // else
                     //     secbase = info->sechdrs[sym[i].st_shndx].sh_addr;
                     // sym[i].st_value += secbase;
-                    // break;
 
                     // TODO: Handle special sections like percpu
                     // Normal symbol defined in a section
@@ -293,7 +413,7 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 .elf
                 .shdr_strtab
                 .get_at(shdr.sh_name)
-                .unwrap_or("<unknown>");
+                .ok_or(ModuleErr::InvalidElf)?;
 
             // Not a valid relocation section?
             if infosec >= self.elf.section_headers.len() as u32 {
@@ -317,11 +437,14 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 .elf
                 .shdr_strtab
                 .get_at(to_section.sh_name)
-                .unwrap_or("<unknown>");
+                .ok_or(ModuleErr::InvalidElf)?;
 
-            println!(
-                "Applying relocations for section '{}' to '{}'",
-                sec_name, to_sec_name
+            let rela_entries = shdr.sh_size as usize / shdr.sh_entsize as usize;
+            log::error!(
+                "Applying relocations for section '{}' to '{}', {} entries",
+                sec_name,
+                to_sec_name,
+                rela_entries
             );
 
             match self.get_machine_type() {
@@ -329,7 +452,15 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                     crate::arch::Riscv64ArchRelocate::apply_relocate_add(
                         self.elf_data,
                         &self.elf.section_headers,
-                        &self.elf.strtab,
+                        &load_info,
+                        idx,
+                        owner,
+                    )?;
+                }
+                "LoongArch" => {
+                    crate::arch::Loongarch64ArchRelocate::apply_relocate_add(
+                        self.elf_data,
+                        &self.elf.section_headers,
                         &load_info,
                         idx,
                         owner,
