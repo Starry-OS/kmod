@@ -401,10 +401,10 @@ impl Loongarch64RelocationType {
                 rela_stack_push(rela_stack, rela_stack_top, opr1 & opr2)?;
             }
             LaRelTy::R_LARCH_SOP_ADD => {
-                rela_stack_push(rela_stack, rela_stack_top, opr1 + opr2)?;
+                rela_stack_push(rela_stack, rela_stack_top, opr1.wrapping_add(opr2))?
             }
             LaRelTy::R_LARCH_SOP_SUB => {
-                rela_stack_push(rela_stack, rela_stack_top, opr1 - opr2)?;
+                rela_stack_push(rela_stack, rela_stack_top, opr1.wrapping_sub(opr2))?
             }
             LaRelTy::R_LARCH_SOP_SL => {
                 rela_stack_push(rela_stack, rela_stack_top, opr1 << opr2)?;
@@ -540,25 +540,25 @@ impl Loongarch64RelocationType {
         match *self {
             LaRelTy::R_LARCH_ADD32 => {
                 let original = location.read::<i32>();
-                let result = original + address as i32;
+                let result = original.wrapping_add(address as i32);
                 location.write(result);
                 Ok(())
             }
             LaRelTy::R_LARCH_ADD64 => {
                 let original = location.read::<i64>();
-                let result = original + address as i64;
+                let result = original.wrapping_add(address as i64);
                 location.write(result);
                 Ok(())
             }
             LaRelTy::R_LARCH_SUB32 => {
                 let original = location.read::<i32>();
-                let result = original - address as i32;
+                let result = original.wrapping_sub(address as i32);
                 location.write(result);
                 Ok(())
             }
             LaRelTy::R_LARCH_SUB64 => {
                 let original = location.read::<i64>();
-                let result = original - address as i64;
+                let result = original.wrapping_sub(address as i64);
                 location.write(result);
                 Ok(())
             }
@@ -688,7 +688,7 @@ impl Loongarch64ArchRelocate {
 
             // This is where to make the change
             let location = sechdrs[rel_section.sh_info as usize].sh_addr + rela.r_offset;
-            let sym = load_info.syms[sym_idx];
+            let (sym, sym_name) = &load_info.syms[sym_idx];
 
             // if (IS_ERR_VALUE(sym->st_value)) {
             //     /* Ignore unresolved weak symbol */
@@ -697,6 +697,7 @@ impl Loongarch64ArchRelocate {
             //     pr_warn("%s: Unknown symbol %s\n", mod->name, strtab + sym->st_name);
             //     return -ENOENT;
             // }
+
             let reloc_type = Loongarch64RelocationType::try_from(rel_type).map_err(|_| {
                 ModuleErr::RelocationFailed(format!("Invalid relocation type: {}", rel_type))
             })?;
@@ -717,7 +718,6 @@ impl Loongarch64ArchRelocate {
 
             match res {
                 Err(e) => {
-                    let sym_name = &load_info.symbol_names[sym_idx];
                     log::error!("[{}]: ({}) {:?}", module.name(), sym_name, e);
                     return Err(e);
                 }

@@ -415,7 +415,7 @@ impl Aarch64RelocationType {
                 address,
                 0,
                 21,
-                Aarch64InsnImmType::AARCH64_INSN_IMM_26,
+                Aarch64InsnImmType::AARCH64_INSN_IMM_ADR,
             )?,
             Arm64RelTy::R_AARCH64_ADR_PREL_PG_HI21_NC | Arm64RelTy::R_AARCH64_ADR_PREL_PG_HI21 => {
                 if *self == Arm64RelTy::R_AARCH64_ADR_PREL_PG_HI21_NC {
@@ -547,12 +547,11 @@ impl Aarch64ArchRelocate {
 
             // loc corresponds to P in the AArch64 ELF document.
             let location = sechdrs[rel_section.sh_info as usize].sh_addr + rela.r_offset;
-            let sym = load_info.syms[sym_idx];
+            let (sym, sym_name) = &load_info.syms[sym_idx];
 
             let reloc_type = Arm64RelTy::try_from(rel_type).map_err(|_| {
                 ModuleErr::RelocationFailed(format!("Invalid relocation type: {}", rel_type))
             })?;
-
             // val corresponds to (S + A) in the AArch64 ELF document.
             let target_addr = sym.st_value.wrapping_add(rela.r_addend as u64);
 
@@ -568,7 +567,6 @@ impl Aarch64ArchRelocate {
             let res = reloc_type.apply_relocation(location, target_addr);
             match res {
                 Err(e) => {
-                    let sym_name = &load_info.symbol_names[sym_idx];
                     log::error!("[{}]: ({}) {:?}", module.name(), sym_name, e);
                     return Err(e);
                 }

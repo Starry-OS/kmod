@@ -129,8 +129,7 @@ const fn align_up(addr: usize, align: usize) -> usize {
 // }
 
 pub struct ModuleLoadInfo {
-    pub(crate) syms: Vec<goblin::elf::sym::Sym>,
-    pub(crate) symbol_names: Vec<String>,
+    pub(crate) syms: Vec<(goblin::elf::sym::Sym, String)>,
 }
 
 impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
@@ -247,11 +246,6 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 continue;
             }
 
-            assert!(
-                shdr.sh_addr % 4096 == 0,
-                "Section '{}' address not page-aligned",
-                sec_name
-            );
             let file_offset = shdr.sh_offset as usize;
             let size = shdr.sh_size as usize;
 
@@ -273,9 +267,12 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
             let raw_addr = addr.as_ptr() as u64;
 
             // Copy section data from ELF to allocated memory
-            let section_data = &self.elf_data[file_offset..file_offset + size];
-            unsafe {
-                core::ptr::copy_nonoverlapping(section_data.as_ptr(), addr.as_mut_ptr(), size);
+            // For SHT_NOBITS sections (like .bss), memory is already zeroed by vmalloc
+            if shdr.sh_type != goblin::elf::section_header::SHT_NOBITS {
+                let section_data = &self.elf_data[file_offset..file_offset + size];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(section_data.as_ptr(), addr.as_mut_ptr(), size);
+                }
             }
 
             // Store the allocated page info
@@ -309,12 +306,16 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
     ///
     /// See <https://elixir.bootlin.com/linux/v6.6/source/kernel/module/main.c#L1367>
     fn simplify_symbols(&self) -> Result<ModuleLoadInfo> {
-        let mut loadinfo = ModuleLoadInfo {
-            syms: Vec::new(),
-            symbol_names: Vec::new(),
-        };
+        let mut loadinfo = ModuleLoadInfo { syms: Vec::new() };
 
-        for sym in self.elf.syms.iter() {
+        // Skip the first symbol (index 0), which is always the undefined symbol
+        for (idx, sym) in self.elf.syms.iter().enumerate() {
+            if idx == 0 {
+                loadinfo.syms.push((sym, "".to_string()));
+                // Symbol 0 is always SHN_UNDEF and should be skipped
+                continue;
+            }
+
             let sym_name = self.elf.strtab.get_at(sym.st_name).unwrap_or("<unknown>");
 
             let sym_name = format!("{:#}", rustc_demangle::demangle(sym_name));
@@ -330,8 +331,8 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                 sym_size
             );
 
-            loadinfo.syms.push(sym);
-            loadinfo.symbol_names.push(sym_name.clone());
+            // Create a mutable copy for potential updates
+            let mut updated_sym = sym;
 
             match sym.st_shndx as _ {
                 goblin::elf::section_header::SHN_UNDEF => {
@@ -345,9 +346,8 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
                             sym_bind_to_str(sym.st_bind()),
                             addr
                         );
-                        // we would update the symbol table entry's st_value
-                        // to reflect the resolved address.
-                        loadinfo.syms.last_mut().unwrap().st_value = addr as u64;
+                        // Update the symbol table entry's st_value to the resolved address
+                        updated_sym.st_value = addr as u64;
                     } else {
                         // Ok if weak or ignored.
                         if sym.st_bind() == goblin::elf::sym::STB_WEAK {
@@ -389,16 +389,22 @@ impl<'a, H: KernelModuleHelper> ModuleLoader<'a, H> {
 
                     // TODO: Handle special sections like percpu
                     // Normal symbol defined in a section
-                    loadinfo.syms.last_mut().unwrap().st_value +=
-                        self.elf.section_headers[ty as usize].sh_addr;
+                    // Add section base address to symbol's offset within the section
+                    let secbase = self.elf.section_headers[ty as usize].sh_addr;
+                    updated_sym.st_value = sym.st_value.wrapping_add(secbase);
                     log::trace!(
-                        "  -> Defined symbol '{}' in section {} at address 0x{:016x}",
+                        "  -> Defined symbol '{}' in section {} at address 0x{:016x} (base: 0x{:016x} + offset: 0x{:016x})",
                         sym_name,
                         ty,
-                        loadinfo.syms.last().unwrap().st_value
+                        updated_sym.st_value,
+                        secbase,
+                        sym.st_value
                     );
                 }
             }
+
+            // Push the updated symbol to the list
+            loadinfo.syms.push((updated_sym, sym_name));
         }
 
         Ok(loadinfo)

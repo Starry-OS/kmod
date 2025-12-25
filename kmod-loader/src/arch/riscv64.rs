@@ -242,10 +242,13 @@ impl Rv64RelTy {
 
     /// See <https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/kernel/module.c#L149>
     fn apply_r_riscv_hi20_rela(location: Ptr, address: u64) -> Result<()> {
-        // if (IS_ENABLED(CONFIG_CMODEL_MEDLOW)) // --- IGNORE ---
-        let hi20 = (address + 0x800) & 0xfffff000;
+        // Compute HI20 using 32-bit signed arithmetic, matching C implementation
+        let address32 = address as i32;
+        // Mirror C: ((s32)v + 0x800) & 0xfffff000
+        // Do the wrapping add in i32, then mask in u32 to avoid overflowing literal issues.
+        let hi20 = ((address32.wrapping_add(0x800)) as u32) & 0xfffff000u32;
         let original_inst = location.read::<u32>();
-        location.write((original_inst & 0xfff) | (hi20 as u32));
+        location.write((original_inst & 0xfff) | hi20);
         Ok(())
     }
 
@@ -325,41 +328,44 @@ impl Rv64RelTy {
 
     fn apply_r_riscv_align_rela(location: Ptr, _address: u64) -> Result<()> {
         Err(ModuleErr::RelocationFailed(format!(
-            "The unexpected relocation type 'R_RISCV_ALIGN' from PC = %{:p}",
+            "The unexpected relocation type 'R_RISCV_ALIGN' from PC = {:p}",
             location.as_ptr::<u32>()
         )))
     }
 
     fn apply_r_riscv_add16_rela(location: Ptr, address: u64) -> Result<()> {
-        location.write(address as u16);
+        let value = location.read::<u16>();
+        location.write(value.wrapping_add(address as u16));
         Ok(())
     }
 
     fn apply_r_riscv_add32_rela(location: Ptr, address: u64) -> Result<()> {
-        location.write(address as u32);
+        let value = location.read::<u32>();
+        location.write(value.wrapping_add(address as u32));
         Ok(())
     }
 
     fn apply_r_riscv_add64_rela(location: Ptr, address: u64) -> Result<()> {
-        location.write(address);
+        let value = location.read::<u64>();
+        location.write(value.wrapping_add(address));
         Ok(())
     }
 
     fn apply_r_riscv_sub16_rela(location: Ptr, address: u64) -> Result<()> {
         let value = location.read::<u16>();
-        location.write(value - address as u16);
+        location.write(value.wrapping_sub(address as u16));
         Ok(())
     }
 
     fn apply_r_riscv_sub32_rela(location: Ptr, address: u64) -> Result<()> {
         let value = location.read::<u32>();
-        location.write(value - address as u32);
+        location.write(value.wrapping_sub(address as u32));
         Ok(())
     }
 
     fn apply_r_riscv_sub64_rela(location: Ptr, address: u64) -> Result<()> {
         let value = location.read::<u64>();
-        location.write(value - address);
+        location.write(value.wrapping_sub(address));
         Ok(())
     }
 
@@ -418,13 +424,12 @@ impl Riscv64ArchRelocate {
 
             // This is where to make the change
             let location = sechdrs[rel_section.sh_info as usize].sh_addr + rela.r_offset;
-            let sym = load_info.syms[sym_idx];
 
             let reloc_type = Riscv64RelocationType::try_from(rel_type).map_err(|_| {
                 ModuleErr::RelocationFailed(format!("Invalid relocation type: {}", rel_type))
             })?;
 
-            let sym_name = &load_info.symbol_names[sym_idx];
+            let (sym, sym_name) = &load_info.syms[sym_idx];
 
             let mut target_addr = sym.st_value.wrapping_add(rela.r_addend as u64);
 
@@ -449,7 +454,7 @@ impl Riscv64ArchRelocate {
                         && (hi20_type == Rv64RelTy::R_RISCV_PCREL_HI20
                             || hi20_type == Rv64RelTy::R_RISCV_GOT_HI20)
                     {
-                        let hi20_sym = load_info.syms[get_rela_sym_idx(inner_rela.r_info)];
+                        let (hi20_sym, _) = load_info.syms[get_rela_sym_idx(inner_rela.r_info)];
 
                         let hi20_sym_val = hi20_sym.st_value as i64 + inner_rela.r_addend;
                         // Calculate lo12
@@ -488,7 +493,6 @@ impl Riscv64ArchRelocate {
             let res = reloc_type.apply_relocation(location, target_addr);
             match res {
                 Err(e) => {
-                    let sym_name = &load_info.symbol_names[sym_idx];
                     log::error!("[{}]: ({}) {:?}", module.name(), sym_name, e);
                     return Err(e);
                 }

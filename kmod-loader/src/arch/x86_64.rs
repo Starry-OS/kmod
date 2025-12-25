@@ -77,7 +77,10 @@ impl X86_64RelocationType {
                 size = 4;
             }
             X64RelTy::R_X86_64_32S => {
-                if target_addr as i64 != target_addr as i32 as i64 {
+                // Check if the value fits in a signed 32-bit integer
+                // C code: if ((s64)val != *(s32 *)&val) goto overflow;
+                // This checks: i64_value != sign_extend(low_32_bits_as_i32)
+                if (target_addr as i64) != ((target_addr as i32) as i64) {
                     return Err(overflow());
                 }
                 size = 4;
@@ -139,7 +142,7 @@ impl X86_64ArchRelocate {
 
             // This is where to make the change
             let location = sechdrs[rel_section.sh_info as usize].sh_addr + rela.r_offset;
-            let sym = load_info.syms[sym_idx];
+            let (sym, sym_name) = &load_info.syms[sym_idx];
 
             let reloc_type = X86_64RelocationType::try_from(rel_type).map_err(|_| {
                 ModuleErr::RelocationFailed(format!("Invalid relocation type: {}", rel_type))
@@ -158,7 +161,6 @@ impl X86_64ArchRelocate {
             let res = reloc_type.apply_relocation(location, target_addr);
             match res {
                 Err(e) => {
-                    let sym_name = &load_info.symbol_names[sym_idx];
                     log::error!("[{}]: '{}' {:?}", module.name(), sym_name, e);
                     return Err(e);
                 }
